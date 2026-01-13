@@ -1,0 +1,226 @@
+import sys
+import math
+import time
+import random
+import serial
+import serial.tools.list_ports
+from PySide6 import QtWidgets, QtCore
+import pyqtgraph as pg
+from pyqtgraph.exporters import ImageExporter
+import datetime
+import cv2
+import numpy as np
+
+
+class SerialThread(QtCore.QThread):
+    data_signal = QtCore.Signal(float)
+
+    def __init__(self, port, baud=115200):
+        super().__init__()
+        self.port = port
+        self.baud = baud
+        self.running = False
+
+    def run(self):
+        try:
+            ser = serial.Serial(self.port, self.baud, timeout=1)
+            MainWindow.set_device_connected(True)
+            self.running = True
+            while self.running:
+                line = ser.readline().decode(errors='ignore').strip()
+                if line:
+                    try:
+                        self.data_signal.emit(float(line))
+                    except:
+                        pass
+            ser.close()
+        except:
+            pass
+        MainWindow.set_device_connected(False)
+
+    def stop(self):
+        self.running = False
+
+
+class SimThread(QtCore.QThread):
+    data_signal = QtCore.Signal(float)
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.t = 0.0
+
+    def run(self):
+        MainWindow.set_device_connected(True, simulation=True)
+        self.running = True
+
+        while self.running:
+            phase = (self.t % 1.0)
+
+            if phase < 0.1:
+                pressure = 80 + (phase / 0.1) * 55
+            elif phase < 0.35:
+                pressure = 135 - (phase - 0.1) * 90
+            elif phase < 0.45:
+                pressure = 90 + (0.45 - phase) * 60
+            else:
+                pressure = 75 + (0.45 - min(phase, 0.45)) * 30
+
+            noise = (random.random() - 0.5) * 4
+            respiration = 5 * math.sin(self.t * 0.3)
+            ripple = 3 * math.sin(self.t * 20)
+
+            pressure += noise + respiration + ripple
+
+            self.data_signal.emit(pressure)
+
+            self.t += 0.01
+            time.sleep(0.01)
+
+        MainWindow.set_device_connected(False)
+
+    def stop(self):
+        self.running = False
+
+
+class MainWindow(QtWidgets.QWidget):
+    device_status = None
+    record_status = None
+
+    @staticmethod
+    def set_device_connected(state, simulation=False):
+        if MainWindow.device_status:
+            if state:
+                MainWindow.device_status.setText(
+                    "Device: 🟢 SIM" if simulation else "Device: 🟢 Connected"
+                )
+                MainWindow.device_status.setStyleSheet("color: #00ff55; font-weight: bold;")
+            else:
+                MainWindow.device_status.setText("Device: 🔴 Disconnected")
+                MainWindow.device_status.setStyleSheet("color: red; font-weight: bold;")
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SignalScope Viewer")
+        self.resize(950, 600)
+
+        self.setStyleSheet("""
+            QWidget { background-color: #1e1e1e; color: #e5e5e5; font-family: Segoe UI; font-size: 14px; }
+            QPushButton {
+                background-color: #333; border: 1px solid #555;
+                border-radius: 8px; padding: 8px 12px;
+            }
+            QPushButton:hover { background-color: #444; }
+            QPushButton:pressed { background-color: #222; }
+            QComboBox { background-color: #2a2a2a; border-radius: 5px; padding: 4px; }
+        """)
+
+        self.plot = pg.PlotWidget(background="#141414")
+        self.plot.showGrid(x=True, y=True, alpha=0.25)
+        self.curve = self.plot.plot(pen=pg.mkPen((255, 0, 0), width=2))  # RED FIXED
+
+        MainWindow.device_status = QtWidgets.QLabel("Device: 🔴 Disconnected")
+        MainWindow.device_status.setStyleSheet("color: red; font-weight: bold;")
+        MainWindow.record_status = QtWidgets.QLabel("Recording: 🟡 Idle")
+        MainWindow.record_status.setStyleSheet("color: yellow; font-weight: bold;")
+
+        self.com_port = QtWidgets.QComboBox()
+        for p in serial.tools.list_ports.comports():
+            self.com_port.addItem(p.device)
+
+        self.start_btn = QtWidgets.QPushButton("▶ Start Recording")
+        self.stop_btn = QtWidgets.QPushButton("■ Stop")
+        self.sim_btn = QtWidgets.QPushButton("🧪 Test BP Signal")
+        self.capture_btn = QtWidgets.QPushButton("📸 Screenshot")
+        self.save_btn = QtWidgets.QPushButton("💾 Save Data")
+
+        self.stop_btn.setEnabled(False)
+
+        status_box = QtWidgets.QHBoxLayout()
+        status_box.addWidget(MainWindow.device_status)
+        status_box.addSpacing(40)
+        status_box.addWidget(MainWindow.record_status)
+
+        hbox = QtWidgets.QHBoxLayout()
+        hbox.addWidget(self.start_btn)
+        hbox.addWidget(self.stop_btn)
+        hbox.addWidget(self.sim_btn)
+        hbox.addWidget(self.capture_btn)
+        hbox.addStretch()
+        hbox.addWidget(QtWidgets.QLabel("COM:"))
+        hbox.addWidget(self.com_port)
+        hbox.addWidget(self.save_btn)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(status_box)
+        layout.addWidget(self.plot)
+        layout.addLayout(hbox)
+
+        self.data = []
+        self.thread = None
+        self.sim_thread = None
+
+        self.start_btn.clicked.connect(self.start_serial)
+        self.sim_btn.clicked.connect(self.start_sim)
+        self.stop_btn.clicked.connect(self.stop_all)
+        self.save_btn.clicked.connect(self.save_csv)
+        self.capture_btn.clicked.connect(self.capture_screenshot)
+
+    def start_serial(self):
+        self.data = []
+        port = self.com_port.currentText()
+        self.thread = SerialThread(port)
+        self.thread.data_signal.connect(self.update_plot)
+        self.thread.start()
+
+        MainWindow.record_status.setText("Recording: 🟢 Active")
+        MainWindow.record_status.setStyleSheet("color: #00ff55; font-weight: bold;")
+        self.stop_btn.setEnabled(True)
+
+    def start_sim(self):
+        self.data = []
+        self.sim_thread = SimThread()
+        self.sim_thread.data_signal.connect(self.update_plot)
+        self.sim_thread.start()
+
+        MainWindow.record_status.setText("Recording: 🟢 BP Simulation")
+        MainWindow.record_status.setStyleSheet("color: #00ff55; font-weight: bold;")
+        self.stop_btn.setEnabled(True)
+
+    def stop_all(self):
+        if self.thread:
+            self.thread.stop()
+        if self.sim_thread:
+            self.sim_thread.stop()
+
+        MainWindow.record_status.setText("Recording: 🔴 Stopped")
+        MainWindow.record_status.setStyleSheet("color: orange; font-weight: bold;")
+        self.stop_btn.setEnabled(False)
+
+    def update_plot(self, value):
+        self.data.append(value)
+        if len(self.data) > 2000:
+            self.data.pop(0)
+        self.curve.setData(self.data)
+
+    def save_csv(self):
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV (*.csv)")
+        if fname:
+            with open(fname, "w") as f:
+                for v in self.data:
+                    f.write(f"{v}\n")
+
+    def capture_screenshot(self):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Screenshot", f"signal_{timestamp}.png", "PNG (*.png)"
+        )
+        if fname:
+            exporter = ImageExporter(self.plot.plotItem)
+            exporter.export(fname)
+
+
+app = QtWidgets.QApplication(sys.argv)
+window = MainWindow()
+window.show()
+sys.exit(app.exec())
