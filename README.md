@@ -107,8 +107,7 @@ SignalScope can be used as a lightweight tool for:
 
 Biomedical Engineering | Embedded Systems | Signal Processing
 
-- GitHub: https://github.com/<your-username>
-- LinkedIn: <your-linkedin-profile>
+
 
 ---
 
